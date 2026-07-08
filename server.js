@@ -26,7 +26,7 @@ if (!JWT_SECRET || JWT_SECRET.length < 16) {
 // CORS_ORIGIN accepte une liste d'origines séparées par des virgules, ex :
 // "https://concourspro.vercel.app,https://concourspro-git-preview.vercel.app,http://localhost:5173"
 // (utile car Vercel génère une URL différente par preview/branche en plus du domaine de prod).
-const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || 'http://localhost:5173')
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || 'https://concourpro.vercel.app')
   .split(',')
   .map(o => o.trim())
   .filter(Boolean);
@@ -44,17 +44,17 @@ app.use(express.json());
 
 // Pool MySQL
 const pool = mysql.createPool({
-  host:     process.env.DB_HOST     || 'localhost',
+  host:     process.env.DB_HOST     || 'bc8oqpfkhanmmedilpnt-mysql.services.clever-cloud.com',
   port:     parseInt(process.env.DB_PORT || '3306'),
-  user:     process.env.DB_USER     || 'root',
-  password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME     || 'concourspro',
+  user:     process.env.DB_USER     || 'uzlfrg3bedkevm1o',
+  password: process.env.DB_PASSWORD || 'HSryf8jsXtBqnKDMDJOP',
+  database: process.env.DB_NAME     || 'bc8oqpfkhanmmedilpnt',
   waitForConnections: true,
   connectionLimit: 10,
 });
 
 // ── Envoi d'emails (SMTP réel si configuré, sinon simulation dans les logs) ────
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://concourpro.vercel.app';
 const SMTP_CONFIGURED = !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
 
 const mailTransporter = SMTP_CONFIGURED
