@@ -12,13 +12,14 @@ services:
     rootDir: backend
     buildCommand: npm install
     startCommand: npm start
+    healthCheckPath: /api/health
     envVars:
       - key: PORT
-        value: 3001
+        value: "3001"
       - key: DB_HOST
         sync: false
       - key: DB_PORT
-        value: 3306
+        value: "3306"
       - key: DB_USER
         sync: false
       - key: DB_PASSWORD
@@ -27,13 +28,16 @@ services:
         sync: false
       - key: JWT_SECRET
         sync: false
+      # Liste d'origines separees par des virgules — ex:
+      # https://concourspro.vercel.app,https://concourspro-git-preview-xxx.vercel.app,http://localhost:5173
+      # A renseigner manuellement dans le dashboard Render (marque sync:false).
       - key: CORS_ORIGIN
         sync: false
       - key: SUPER_ADMIN_EMAIL
         sync: false
       - key: SUPER_ADMIN_PASSWORD
         sync: false
-      - key: ANTHROPIC_API_KEY
+      - key: GEMINI_API_KEY
         sync: false
       - key: UPLOAD_DIR
         value: ./uploads
@@ -42,9 +46,9 @@ services:
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT
-        value: 587
+        value: "587"
       - key: SMTP_SECURE
-        value: false
+        value: "false"
       - key: SMTP_USER
         sync: false
       - key: SMTP_PASS

@@ -23,7 +23,23 @@ if (!JWT_SECRET || JWT_SECRET.length < 16) {
   process.exit(1);
 }
 
-app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://localhost:5173', credentials: true }));
+// CORS_ORIGIN accepte une liste d'origines séparées par des virgules, ex :
+// "https://concourspro.vercel.app,https://concourspro-git-preview.vercel.app,http://localhost:5173"
+// (utile car Vercel génère une URL différente par preview/branche en plus du domaine de prod).
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN || 'http://localhost:5173')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, cb) {
+    // Requêtes sans en-tête Origin (ex: curl, health checks serveur-à-serveur) : on laisse passer.
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    cb(new Error(`CORS: origine non autorisée -> ${origin}`));
+  },
+  credentials: true,
+}));
 app.use(express.json());
 
 // Pool MySQL
@@ -47,6 +63,17 @@ const mailTransporter = SMTP_CONFIGURED
       port:   parseInt(process.env.SMTP_PORT || '587'),
       secure: process.env.SMTP_SECURE === 'true', // true pour le port 465, false pour les autres
       auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      // pool: true réutilise un petit nombre de connexions SMTP au lieu
+      // d'en ouvrir/fermer une par email. Sans ça, un envoi en masse (ex:
+      // EmailNotifier qui notifie N candidats à la suite) ouvre une nouvelle
+      // connexion TCP+TLS+AUTH par email : sur le tiers gratuit de Render
+      // (CPU throttlée) ça finit par timeout ou se faire jeter par le
+      // fournisseur SMTP après le 1er envoi, et les suivants échouent en
+      // silence (sendMail() n'a jamais levé d'exception côté frontend) —
+      // symptôme observé : "un seul candidat reçoit la notification".
+      pool: true,
+      maxConnections: 3,
+      maxMessages: 100,
     })
   : null;
 
@@ -81,9 +108,16 @@ async function sendMail(to, subject, html) {
 // Génère un mot de passe lisible et suffisamment fort (évite les caractères ambigus 0/O, 1/l/I)
 function generatePassword(length = 10) {
   const chars = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
-  const bytes = require('crypto').randomBytes(length);
+  const crypto = require('crypto');
+  // Rejette les octets au-delà du plus grand multiple de chars.length pour
+  // éviter le biais de modulo (256 % 55 !== 0, certains caractères seraient
+  // sinon légèrement plus probables que d'autres).
+  const max = Math.floor(256 / chars.length) * chars.length;
   let out = '';
-  for (let i = 0; i < length; i++) out += chars[bytes[i] % chars.length];
+  while (out.length < length) {
+    const byte = crypto.randomBytes(1)[0];
+    if (byte < max) out += chars[byte % chars.length];
+  }
   return out;
 }
 
@@ -114,6 +148,22 @@ function authMiddleware(req, res, next) {
   catch { res.status(401).json({ error: 'Token invalide ou expire' }); }
 }
 
+// Authentification OPTIONNELLE : utilisée sur les routes publiques (pages
+// candidat sans compte — consultation, réclamations, documents). Si un token
+// valide est présent (ex. un admin connecté qui visite quand même la page
+// publique), req.user est rempli normalement. Sinon, la requête continue
+// avec req.user = null : c'est un visiteur public/candidat sans compte, il
+// n'existe plus de rôle "user" — checkEntityPermission traite ce cas comme
+// un droit minimal explicite (voir PUBLIC_ENTITIES ci-dessous).
+function optionalAuthMiddleware(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) { req.user = null; return next(); }
+  try { req.user = jwt.verify(token, JWT_SECRET); }
+  catch { req.user = null; }
+  next();
+}
+
 function requireSuperAdmin(req, res, next) {
   if (req.user?.role !== 'super_admin')
     return res.status(403).json({ error: 'Acces reserve au Super Admin' });
@@ -141,38 +191,66 @@ function loginRateLimit(req, res, next) {
   next();
 }
 
+// ── Rate limiting sur /api/jury-config/verify (anti brute-force du PIN) ───────
+// Le PIN peut faire aussi peu que 4 caracteres : sans limite, il est
+// brute-forcable en quelques secondes par un visiteur non authentifie.
+const pinAttempts = new Map(); // ip -> { count, firstAttempt }
+const PIN_MAX_ATTEMPTS = 8;
+const PIN_WINDOW_MS    = 15 * 60 * 1000; // 15 min
+
+function pinRateLimit(req, res, next) {
+  const ip  = req.ip || req.connection.remoteAddress || 'unknown';
+  const now = Date.now();
+  const rec = pinAttempts.get(ip);
+  if (!rec || now - rec.firstAttempt > PIN_WINDOW_MS) {
+    pinAttempts.set(ip, { count: 1, firstAttempt: now });
+    return next();
+  }
+  if (rec.count >= PIN_MAX_ATTEMPTS) {
+    const waitMin = Math.ceil((PIN_WINDOW_MS - (now - rec.firstAttempt)) / 60000);
+    return res.status(429).json({ valid: false, error: `Trop de tentatives. Reessayez dans ${waitMin} min.` });
+  }
+  rec.count++;
+  next();
+}
+
 // ── Permissions par entité et par rôle sur le CRUD générique ──────────────────
 // 'read'  : qui peut lire (GET)
 // 'write' : qui peut créer/modifier/supprimer (POST/PUT/DELETE)
-// Rôles : super_admin, admin, jury, enseignant
+// Rôles connectés : super_admin, admin, jury, enseignant.
+// Il n'existe plus de rôle "user" (candidat) — le grand public accède à
+// certaines entités SANS AUCUN COMPTE, via les routes publiques ci-dessous.
 const ENTITY_PERMISSIONS = {
-  Candidate:        { read: ['super_admin','admin','jury','enseignant','user'], write: ['super_admin','admin','jury'] },
-  Concours:         { read: ['super_admin','admin','jury','enseignant','user'], write: ['super_admin','admin'] },
-  SalleExamen:      { read: ['super_admin','admin','jury','enseignant'],        write: ['super_admin','admin'] },
-  CandidatDocument: { read: ['super_admin','admin','jury','enseignant','user'], write: ['super_admin','admin','jury','enseignant','user'] },
-  JuryLog:          { read: ['super_admin','admin','jury'],                     write: ['super_admin','admin','jury'] },
-  Reclamation:      { read: ['super_admin','admin','jury','enseignant','user'], write: ['super_admin','admin','jury','enseignant','user'] },
-  AuditLog:         { read: ['super_admin','admin'],                            write: ['super_admin'] },
-  ConcoursConfig:   { read: ['super_admin','admin','jury'],                     write: ['super_admin','admin'] },
-  Pointage:         { read: ['super_admin','admin','jury'],                     write: ['super_admin','admin','jury'] },
-  User:             { read: ['super_admin'],                                    write: ['super_admin'] },
-  SuperAdminConfig: { read: ['super_admin'],                                    write: ['super_admin'] },
-  JuryConfig:       { read: ['super_admin','admin'],                            write: ['super_admin'] },
-  Filiere:          { read: ['super_admin','admin','jury','enseignant','user'], write: ['super_admin','admin'] },
-  Departement:      { read: ['super_admin','admin','jury','enseignant','user'], write: ['super_admin','admin'] },
+  Candidate:        { read: ['super_admin','admin','jury','enseignant'], write: ['super_admin','admin','jury'] },
+  Concours:         { read: ['super_admin','admin','jury','enseignant'], write: ['super_admin','admin'] },
+  SalleExamen:      { read: ['super_admin','admin','jury','enseignant'], write: ['super_admin','admin'] },
+  CandidatDocument: { read: ['super_admin','admin','jury','enseignant'], write: ['super_admin','admin','jury','enseignant'] },
+  JuryLog:          { read: ['super_admin','admin','jury'],              write: ['super_admin','admin','jury'] },
+  Reclamation:      { read: ['super_admin','admin','jury','enseignant'], write: ['super_admin','admin','jury','enseignant'] },
+  AuditLog:         { read: ['super_admin','admin'],                     write: ['super_admin'] },
+  ConcoursConfig:   { read: ['super_admin','admin','jury'],              write: ['super_admin','admin'] },
+  Pointage:         { read: ['super_admin','admin','jury'],              write: ['super_admin','admin','jury'] },
+  User:             { read: ['super_admin'],                             write: ['super_admin'] },
+  SuperAdminConfig: { read: ['super_admin'],                             write: ['super_admin'] },
+  JuryConfig:       { read: ['super_admin','admin'],                     write: ['super_admin'] },
+  Filiere:          { read: ['super_admin','admin','jury','enseignant'], write: ['super_admin','admin'] },
+  Departement:      { read: ['super_admin','admin','jury','enseignant'], write: ['super_admin','admin'] },
 };
-// Note : le rôle "user" (candidat / grand public) obtient des droits minimaux :
-// lecture des données publiques de consultation (Candidate, Concours, Filiere,
-// Departement) et lecture/écriture de ses propres réclamations (Reclamation).
-// Il n'a explicitement PAS le droit d'écrire sur Candidate, SalleExamen, etc.
-//
-// Reclamation est ouvert en lecture/écriture à TOUS les rôles (y compris jury
-// et enseignant) car les pages "/" (Home) et "/reclamations" sont accessibles
-// à ALL_ROLES dans src/lib/roleAccess.js (PAGE_ACCESS) — un rôle autorisé à
-// ouvrir une page doit toujours avoir les droits sur les entités qu'elle
-// charge, sous peine d'erreurs 403 en cascade qui cassent toute la page
-// (cf. bug : page d'accueil non fonctionnelle pour jury/enseignant faute
-// d'accès à Reclamation, alors qu'ils pouvaient lire Candidate et Concours).
+
+// ── Entités accessibles PUBLIQUEMENT, sans compte ni token ────────────────────
+// Utilisées par les routes /api/public/entities/:entity (voir plus bas), qui
+// alimentent les pages candidat sans authentification (Consultation, Réclamations,
+// Documents Candidat). Volontairement limité à la lecture/écriture strictement
+// nécessaire à ces pages : un visiteur public ne doit jamais pouvoir lire ou
+// écrire au-delà de ce périmètre (pas de SalleExamen, AuditLog, etc.).
+const PUBLIC_ENTITIES = {
+  Candidate:        { read: true,  write: false },
+  Concours:         { read: true,  write: false },
+  Filiere:          { read: true,  write: false },
+  Departement:      { read: true,  write: false },
+  Reclamation:      { read: true,  write: true },
+  CandidatDocument: { read: true,  write: true },
+};
 
 function checkEntityPermission(mode) {
   return (req, res, next) => {
@@ -182,6 +260,20 @@ function checkEntityPermission(mode) {
     const allowed = perm[mode] || [];
     if (!allowed.includes(req.user?.role)) {
       return res.status(403).json({ error: `Acces refuse pour le role "${req.user?.role}" sur ${entity}` });
+    }
+    next();
+  };
+}
+
+// Équivalent de checkEntityPermission, mais pour les routes publiques : pas de
+// rôle à vérifier (le visiteur n'a pas de compte), seulement la liste blanche
+// PUBLIC_ENTITIES qui définit ce qui est exposé sans authentification.
+function checkPublicEntityPermission(mode) {
+  return (req, res, next) => {
+    const entity = req.params.entity;
+    const perm   = PUBLIC_ENTITIES[entity];
+    if (!perm || !perm[mode]) {
+      return res.status(403).json({ error: `Cette ressource n'est pas accessible sans compte.` });
     }
     next();
   };
@@ -281,7 +373,7 @@ app.get('/api/users', authMiddleware, requireSuperAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-const VALID_ROLES = ['admin', 'jury', 'enseignant', 'user'];
+const VALID_ROLES = ['admin', 'jury', 'enseignant'];
 app.post('/api/users', authMiddleware, requireSuperAdmin, async (req, res) => {
   const { name, email, password, role } = req.body;
   if (!name || !email || !password) return res.status(400).json({ error: 'Nom, email et mot de passe requis' });
@@ -370,104 +462,6 @@ app.put('/api/super-admin', authMiddleware, requireSuperAdmin, async (req, res) 
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ===== COMPTES CANDIDATS ADMIS (génération en masse) =====
-
-// Aperçu : liste des candidats admis n'ayant pas encore de compte utilisateur
-app.get('/api/users/admitted-candidates', authMiddleware, requireSuperAdmin, async (req, res) => {
-  try {
-    const [rows] = await pool.query(
-      `SELECT c.id, c.full_name, c.email
-         FROM candidates c
-        WHERE c.final_status = 'admis'
-          AND c.email IS NOT NULL AND c.email <> ''
-          AND NOT EXISTS (
-                SELECT 1 FROM app_users u WHERE u.email = LOWER(c.email)
-              )
-        ORDER BY c.full_name ASC`
-    );
-    const [[{ sansEmail }]] = await pool.query(
-      `SELECT COUNT(*) AS sansEmail FROM candidates
-        WHERE final_status = 'admis' AND (email IS NULL OR email = '')`
-    );
-    res.json({ eligibles: rows, sansEmail });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Génération en masse : crée un compte + envoie un email pour chaque candidat admis éligible
-app.post('/api/users/generate-for-admitted', authMiddleware, requireSuperAdmin, async (req, res) => {
-  const candidateIds = Array.isArray(req.body?.candidateIds) ? req.body.candidateIds : null;
-  try {
-    let query = `SELECT c.id, c.full_name, c.email
-                   FROM candidates c
-                  WHERE c.final_status = 'admis'
-                    AND c.email IS NOT NULL AND c.email <> ''
-                    AND NOT EXISTS (
-                          SELECT 1 FROM app_users u WHERE u.email = LOWER(c.email)
-                        )`;
-    const params = [];
-    if (candidateIds && candidateIds.length) {
-      query += ` AND c.id IN (${candidateIds.map(() => '?').join(',')})`;
-      params.push(...candidateIds);
-    }
-    const [candidats] = await pool.query(query, params);
-
-    const created = [];
-    const echoues  = [];
-
-    for (const cand of candidats) {
-      const email = cand.email.toLowerCase();
-      try {
-        // Un email en double dans le lot pourrait déjà avoir été créé lors de cette boucle
-        const [ex] = await pool.query('SELECT id FROM app_users WHERE email = ?', [email]);
-        if (ex.length) { echoues.push({ full_name: cand.full_name, email, raison: 'Compte déjà existant' }); continue; }
-
-        const password = generatePassword(10);
-        const hash     = await bcrypt.hash(password, 10);
-        const id       = require('crypto').randomUUID();
-
-        await pool.query(
-          'INSERT INTO app_users (id, name, email, password_hash, role, status, created_by) VALUES (?,?,?,?,?,?,?)',
-          [id, cand.full_name, email, hash, 'user', 'actif', req.user.email]
-        );
-
-        const loginUrl = `${FRONTEND_URL}/connexion`;
-        const html = `
-          <div style="font-family: Arial, sans-serif; max-width: 560px; margin: auto;">
-            <h2 style="color:#0f172a;">Félicitations, ${cand.full_name} !</h2>
-            <p>Vous êtes <strong>admis(e)</strong> au concours. Votre compte candidat a été créé sur la plateforme ConcoursPro.</p>
-            <p style="background:#f1f5f9; padding:12px 16px; border-radius:8px;">
-              <strong>Email de connexion :</strong> ${email}<br/>
-              <strong>Mot de passe temporaire :</strong> ${password}
-            </p>
-            <p><a href="${loginUrl}" style="background:#2563eb;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;display:inline-block;">Accéder à la plateforme</a></p>
-            <p style="font-size:13px;color:#64748b;">Lien direct : ${loginUrl}<br/>
-            Pour votre sécurité, pensez à modifier ce mot de passe après votre première connexion.</p>
-          </div>`;
-        const mailResult = await sendMail(email, 'Votre compte ConcoursPro — Résultat d\'admission', html);
-
-        created.push({
-          full_name: cand.full_name,
-          email,
-          password,           // renvoyé une seule fois, pour affichage/export immédiat côté admin
-          emailEnvoye: mailResult.sent,
-          simulated: !!mailResult.simulated,
-        });
-      } catch (err) {
-        echoues.push({ full_name: cand.full_name, email: cand.email, raison: err.message });
-      }
-    }
-
-    res.json({
-      total: candidats.length,
-      crees: created.length,
-      echoues: echoues.length,
-      comptes: created,
-      erreurs: echoues,
-      smtpConfigure: SMTP_CONFIGURED,
-    });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
 // ===== CRUD GENERIQUE =====
 
 app.get('/api/entities/:entity', authMiddleware, checkEntityPermission('read'), async (req, res) => {
@@ -480,16 +474,11 @@ app.get('/api/entities/:entity', authMiddleware, checkEntityPermission('read'), 
   const filters = [], values = [];
   for (const [k, v] of Object.entries(req.query)) {
     if (reserved.has(k) || !/^[a-zA-Z_]+$/.test(k)) continue;
-    filters.push(`\`${k}\` = ?`); values.push(v);
-  }
-  // Un rôle "user" ne doit voir QUE ses propres documents candidat, jamais
-  // ceux des autres — on force le filtre candidate_email côté serveur au
-  // lieu de faire confiance à ce que le frontend envoie (sinon un candidat
-  // pourrait simplement retirer ce paramètre de sa requête pour tout voir).
-  if (req.params.entity === 'CandidatDocument' && req.user?.role === 'user') {
-    const idx = filters.findIndex(f => f.startsWith('`candidate_email`'));
-    if (idx !== -1) { filters.splice(idx, 1); values.splice(idx, 1); }
-    filters.push('LOWER(`candidate_email`) = LOWER(?)'); values.push(req.user.email || '');
+    filters.push(`\`${k}\` = ?`);
+    // req.query ne contient que des strings ; on convertit explicitement les
+    // champs numériques/booléens pour ne pas dépendre de la coercition
+    // implicite de MySQL (`actif` = '1' sur une colonne TINYINT).
+    values.push(NUMERIC_FIELDS.has(k) ? Number(v) : v);
   }
   const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
   try {
@@ -504,9 +493,6 @@ app.get('/api/entities/:entity/:id', authMiddleware, checkEntityPermission('read
   try {
     const [rows] = await pool.query(`SELECT * FROM \`${table}\` WHERE id=? LIMIT 1`, [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'Non trouve' });
-    if (req.params.entity === 'CandidatDocument' && req.user?.role === 'user' && !isOwnCandidateDocument(rows[0], req.user)) {
-      return res.status(403).json({ error: "Vous ne pouvez consulter que vos propres documents." });
-    }
     res.json(safeRow(rows[0]));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -552,18 +538,6 @@ async function validateSalleCapacity(salleId, excludeCandidateId) {
   return null;
 }
 
-// Un rôle "user" (candidat) ne doit jamais pouvoir lire/modifier/supprimer le
-// document d'UN AUTRE candidat — même si ENTITY_PERMISSIONS l'autorise à lire/
-// écrire l'entité CandidatDocument en général. L'appartenance d'un document
-// est déterminée par candidate_email : on considère qu'un compte "user" est
-// le document de CE candidat si son email de connexion correspond (comparaison
-// insensible à la casse), exactement comme Reclamations.jsx retrouve déjà les
-// réclamations d'un candidat par son email.
-function isOwnCandidateDocument(row, user) {
-  if (!row || !user?.email) return false;
-  return String(row.candidate_email || '').toLowerCase() === String(user.email).toLowerCase();
-}
-
 app.post('/api/entities/:entity', authMiddleware, checkEntityPermission('write'), async (req, res) => {
   const entityName = req.params.entity;
   const table = ENTITY_MAP[entityName];
@@ -588,13 +562,6 @@ app.post('/api/entities/:entity', authMiddleware, checkEntityPermission('write')
   if (!data.id) data.id = require('crypto').randomUUID();
   data.created_date = data.created_date || new Date();
   data.updated_date = new Date();
-  // Un rôle "user" ne peut créer un document QUE sous sa propre identité —
-  // on écrase toute valeur envoyée par le client pour candidate_email, afin
-  // qu'un candidat ne puisse pas déposer un document au nom de quelqu'un
-  // d'autre en modifiant simplement la requête.
-  if (entityName === 'CandidatDocument' && req.user?.role === 'user') {
-    data.candidate_email = req.user.email;
-  }
   // Tables sans colonne created_by — ne pas injecter
   const TABLES_NO_CREATED_BY = ['filieres', 'departements', 'jury_config', 'super_admin_config'];
   if (!TABLES_NO_CREATED_BY.includes(table)) {
@@ -640,30 +607,10 @@ app.put('/api/entities/:entity/:id', authMiddleware, checkEntityPermission('writ
       if (err) return res.status(409).json({ error: err });
     }
   }
-  // Un rôle "user" ne peut modifier QUE son propre document candidat — et
-  // même sur son propre document, il ne peut pas toucher aux champs réservés
-  // au jury (statut_verification, commentaire_jury, verifie_par), sinon il
-  // pourrait "auto-valider" son propre document.
-  if (entityName === 'CandidatDocument' && req.user?.role === 'user') {
-    const [ownRows] = await pool.query('SELECT candidate_email FROM candidat_document WHERE id=?', [req.params.id]);
-    if (!ownRows.length) return res.status(404).json({ error: 'Non trouve' });
-    if (!isOwnCandidateDocument(ownRows[0], req.user)) {
-      return res.status(403).json({ error: "Vous ne pouvez modifier que vos propres documents." });
-    }
-  }
   const data = { ...req.body };
   delete data.id;
   // Un non-super_admin ne peut jamais s'auto-promouvoir via le CRUD générique
   if (data.role && req.user?.role !== 'super_admin') delete data.role;
-  // Un rôle "user" ne peut pas réassigner son document à un autre email
-  // (ce qui reviendrait à s'approprier — ou céder — un document candidat),
-  // ni toucher aux champs de validation réservés au jury/admin.
-  if (entityName === 'CandidatDocument' && req.user?.role === 'user') {
-    delete data.candidate_email;
-    delete data.statut_verification;
-    delete data.commentaire_jury;
-    delete data.verifie_par;
-  }
   data.updated_date = new Date();
   if ((table === 'app_users' || table === 'super_admin_config') && data.password) {
     data.password_hash = await bcrypt.hash(data.password, 10);
@@ -691,13 +638,134 @@ app.delete('/api/entities/:entity/:id', authMiddleware, checkEntityPermission('w
   if (entityName === 'User') {
     return res.status(403).json({ error: 'Utilisez /api/users/:id pour supprimer un utilisateur' });
   }
-  // Un rôle "user" ne peut supprimer QUE son propre document candidat.
-  if (entityName === 'CandidatDocument' && req.user?.role === 'user') {
-    const [ownRows] = await pool.query('SELECT candidate_email FROM candidat_document WHERE id=?', [req.params.id]);
-    if (!ownRows.length) return res.status(404).json({ error: 'Non trouve' });
-    if (!isOwnCandidateDocument(ownRows[0], req.user)) {
-      return res.status(403).json({ error: "Vous ne pouvez supprimer que vos propres documents." });
-    }
+  try { await pool.query(`DELETE FROM \`${table}\` WHERE id=?`, [req.params.id]); res.json({ success: true }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ===== CRUD PUBLIC (candidats sans compte) =====
+// Alimente les pages publiques (/consultation, /reclamations,
+// /documents-candidat) : aucune authentification requise. Limité strictement
+// aux entités listées dans PUBLIC_ENTITIES. Pour CandidatDocument et
+// Reclamation, un visiteur ne peut jamais lire, modifier ou supprimer
+// autre chose que SES PROPRES enregistrements — l'appartenance est
+// déterminée par l'adresse email, forcée côté serveur (jamais fait confiance
+// au frontend), exactement comme le faisait auparavant le rôle "user".
+
+function isOwnByEmail(row, email) {
+  if (!row || !email) return false;
+  return String(row.candidate_email || '').toLowerCase() === String(email).toLowerCase();
+}
+
+const OWNED_PUBLIC_ENTITIES = new Set(['CandidatDocument', 'Reclamation']);
+
+app.get('/api/public/entities/:entity', checkPublicEntityPermission('read'), async (req, res) => {
+  const entityName = req.params.entity;
+  const table = ENTITY_MAP[entityName];
+  if (!table) return res.status(404).json({ error: 'Entite inconnue' });
+  const sort = parseSort(req.query.sort);
+  const limit = Math.min(parseInt(req.query.limit) || 100, 500);
+  const offset = Math.max(parseInt(req.query.offset) || 0, 0);
+  const reserved = new Set(['sort', 'limit', 'offset']);
+  const filters = [], values = [];
+  for (const [k, v] of Object.entries(req.query)) {
+    if (reserved.has(k) || !/^[a-zA-Z_]+$/.test(k)) continue;
+    filters.push(`\`${k}\` = ?`);
+    values.push(NUMERIC_FIELDS.has(k) ? Number(v) : v);
+  }
+  // Un visiteur public ne doit jamais pouvoir lister TOUS les documents ou
+  // TOUTES les réclamations : on exige explicitement un filtre par email et
+  // on l'impose nous-mêmes (insensible à la casse), sans faire confiance au
+  // paramètre brut envoyé par le client.
+  if (OWNED_PUBLIC_ENTITIES.has(entityName)) {
+    const email = req.query.candidate_email;
+    if (!email) return res.status(400).json({ error: 'candidate_email est requis pour cette recherche.' });
+    const idx = filters.findIndex(f => f.startsWith('`candidate_email`'));
+    if (idx !== -1) { filters.splice(idx, 1); values.splice(idx, 1); }
+    filters.push('LOWER(`candidate_email`) = LOWER(?)'); values.push(email);
+  }
+  const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+  try {
+    const [rows] = await pool.query(`SELECT * FROM \`${table}\` ${where} ORDER BY ${sort} LIMIT ? OFFSET ?`, [...values, limit, offset]);
+    res.json(rows.map(safeRow));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/public/entities/:entity', checkPublicEntityPermission('write'), async (req, res) => {
+  const entityName = req.params.entity;
+  const table = ENTITY_MAP[entityName];
+  if (!table) return res.status(404).json({ error: 'Entite inconnue' });
+  const data = { ...req.body };
+  if (!data.id) data.id = require('crypto').randomUUID();
+  data.created_date = data.created_date || new Date();
+  data.updated_date = new Date();
+  data.created_by = data.created_by || data.candidate_email || null;
+  // Un visiteur public ne peut jamais créer un document ou une réclamation
+  // pré-validé — ces champs restent strictement réservés au jury/admin
+  // dans l'espace de gestion interne.
+  if (entityName === 'CandidatDocument') {
+    delete data.statut_verification;
+    delete data.commentaire_jury;
+    delete data.verifie_par;
+    data.statut_verification = 'en_attente';
+  }
+  if (entityName === 'Reclamation') {
+    delete data.statut;
+    delete data.reponse_admin;
+  }
+  try {
+    await pool.query(`INSERT INTO \`${table}\` SET ?`, [data]);
+    const [rows] = await pool.query(`SELECT * FROM \`${table}\` WHERE id=?`, [data.id]);
+    res.status(201).json(safeRow(rows[0]));
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/public/entities/:entity/:id', checkPublicEntityPermission('write'), async (req, res) => {
+  const entityName = req.params.entity;
+  const table = ENTITY_MAP[entityName];
+  if (!table) return res.status(404).json({ error: 'Entite inconnue' });
+  if (!OWNED_PUBLIC_ENTITIES.has(entityName)) {
+    return res.status(403).json({ error: 'Modification non autorisee sans compte.' });
+  }
+  const email = req.body.candidate_email || req.query.candidate_email;
+  if (!email) return res.status(400).json({ error: 'candidate_email est requis.' });
+  const [ownRows] = await pool.query(`SELECT candidate_email FROM \`${table}\` WHERE id=?`, [req.params.id]);
+  if (!ownRows.length) return res.status(404).json({ error: 'Non trouve' });
+  if (!isOwnByEmail(ownRows[0], email)) {
+    return res.status(403).json({ error: "Vous ne pouvez modifier que vos propres documents." });
+  }
+  const data = { ...req.body };
+  delete data.id;
+  delete data.candidate_email; // ne peut pas réassigner son document à un autre email
+  if (entityName === 'CandidatDocument') {
+    delete data.statut_verification;
+    delete data.commentaire_jury;
+    delete data.verifie_par;
+  }
+  if (entityName === 'Reclamation') {
+    delete data.statut;
+    delete data.reponse_admin;
+  }
+  data.updated_date = new Date();
+  try {
+    await pool.query(`UPDATE \`${table}\` SET ? WHERE id=?`, [data, req.params.id]);
+    const [rows] = await pool.query(`SELECT * FROM \`${table}\` WHERE id=?`, [req.params.id]);
+    res.json(safeRow(rows[0]));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/public/entities/:entity/:id', checkPublicEntityPermission('write'), async (req, res) => {
+  const entityName = req.params.entity;
+  const table = ENTITY_MAP[entityName];
+  if (!table) return res.status(404).json({ error: 'Entite inconnue' });
+  if (!OWNED_PUBLIC_ENTITIES.has(entityName)) {
+    return res.status(403).json({ error: 'Suppression non autorisee sans compte.' });
+  }
+  const email = req.query.candidate_email;
+  if (!email) return res.status(400).json({ error: 'candidate_email est requis.' });
+  const [ownRows] = await pool.query(`SELECT candidate_email FROM \`${table}\` WHERE id=?`, [req.params.id]);
+  if (!ownRows.length) return res.status(404).json({ error: 'Non trouve' });
+  if (!isOwnByEmail(ownRows[0], email)) {
+    return res.status(403).json({ error: "Vous ne pouvez supprimer que vos propres documents." });
   }
   try { await pool.query(`DELETE FROM \`${table}\` WHERE id=?`, [req.params.id]); res.json({ success: true }); }
   catch (err) { res.status(500).json({ error: err.message }); }
@@ -707,17 +775,114 @@ app.delete('/api/entities/:entity/:id', authMiddleware, checkEntityPermission('w
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './uploads';
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+// Assainit le nom de fichier original avant de l'utiliser dans le nom stocké :
+// retire tout séparateur de chemin (../, /, \) et tout caractère hors
+// alphanumérique/point/tiret/underscore, pour empêcher toute traversée de
+// répertoire ou tout nom de fichier fantaisiste (espaces, unicode, etc.).
+function sanitizeFilename(original) {
+  const base = path.basename(String(original || 'fichier'));
+  const cleaned = base.replace(/[^a-zA-Z0-9._-]/g, '_');
+  return cleaned.slice(-150) || 'fichier';
+}
+
 const storage = multer.diskStorage({
   destination: UPLOAD_DIR,
-  filename: (_r, f, cb) => cb(null, `${Date.now()}_${f.originalname}`),
+  filename: (_r, f, cb) => cb(null, `${Date.now()}_${sanitizeFilename(f.originalname)}`),
 });
-const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 } });
 
-app.post('/api/upload', authMiddleware, upload.single('file'), (req, res) => {
+// Upload de documents candidat (pièces justificatives) : PDF/images
+// uniquement, aligné sur ce qu'accepte le frontend (DocumentsCandidat.jsx,
+// attribut accept=".pdf,.jpg,.jpeg,.png,.webp"). Volontairement strict car
+// ces deux routes sont accessibles à des visiteurs sans compte.
+const DOCUMENT_MIME_WHITELIST = new Set([
+  'application/pdf', 'image/jpeg', 'image/png', 'image/webp',
+]);
+function documentFileFilter(_req, file, cb) {
+  if (!DOCUMENT_MIME_WHITELIST.has(file.mimetype)) {
+    return cb(new Error('Type de fichier non autorisé (PDF, JPG, PNG ou WEBP uniquement).'));
+  }
+  cb(null, true);
+}
+const uploadDocument = multer({
+  storage,
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: documentFileFilter,
+});
+
+// Upload pour l'import BAC (PDF/Word/CSV/Excel) : périmètre plus large mais
+// réservé aux comptes authentifiés (voir /api/ai/parse-bac plus bas).
+const IMPORT_MIME_WHITELIST = new Set([
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'text/csv',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+]);
+function importFileFilter(_req, file, cb) {
+  if (!IMPORT_MIME_WHITELIST.has(file.mimetype)) {
+    return cb(new Error('Type de fichier non autorisé pour l\'import BAC.'));
+  }
+  cb(null, true);
+}
+const uploadImport = multer({
+  storage,
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: importFileFilter,
+});
+
+// Gère proprement les erreurs multer (type refusé, taille dépassée) au lieu
+// de laisser passer un statut 500 générique.
+function handleUploadError(err, _req, res, next) {
+  if (err) return res.status(400).json({ error: err.message || 'Fichier invalide.' });
+  next();
+}
+
+app.post('/api/upload', authMiddleware, uploadDocument.single('file'), handleUploadError, (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Aucun fichier recu' });
   res.json({ file_url: `/api/uploads/${req.file.filename}`, filename: req.file.filename, original: req.file.originalname });
 });
-app.use('/api/uploads', express.static(UPLOAD_DIR));
+// Upload PUBLIC : nécessaire pour que le dépôt de documents (pièces
+// justificatives de candidature) fonctionne sur la page publique
+// /documents-candidat, accessible sans compte. Mêmes contraintes de taille
+// que l'upload authentifié, plus une whitelist de type et un rate-limit par
+// IP (aucune authentification ne protège cette route, donc elle serait sinon
+// un vecteur facile d'épuisement du disque serveur).
+const uploadRateLimit = (() => {
+  const attempts = new Map(); // ip -> { count, firstAttempt }
+  const MAX = 20, WINDOW_MS = 15 * 60 * 1000;
+  return (req, res, next) => {
+    const ip  = req.ip || req.connection.remoteAddress || 'unknown';
+    const now = Date.now();
+    const rec = attempts.get(ip);
+    if (!rec || now - rec.firstAttempt > WINDOW_MS) {
+      attempts.set(ip, { count: 1, firstAttempt: now });
+      return next();
+    }
+    if (rec.count >= MAX) {
+      const waitMin = Math.ceil((WINDOW_MS - (now - rec.firstAttempt)) / 60000);
+      return res.status(429).json({ error: `Trop d'envois. Reessayez dans ${waitMin} min.` });
+    }
+    rec.count++;
+    next();
+  };
+})();
+app.post('/api/public/upload', uploadRateLimit, uploadDocument.single('file'), handleUploadError, (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Aucun fichier recu' });
+  res.json({ file_url: `/api/uploads/${req.file.filename}`, filename: req.file.filename, original: req.file.originalname });
+});
+// Sert les fichiers uploadés en pièce jointe forcée (Content-Disposition) et
+// sans exécution possible côté navigateur, plutôt qu'en inline : empêche
+// qu'un fichier malveillant (ex: .html glissé via un type MIME usurpé) ne
+// s'exécute dans le contexte du domaine du backend si jamais il est ouvert
+// directement dans un navigateur.
+app.use('/api/uploads', express.static(UPLOAD_DIR, {
+  setHeaders: (res) => {
+    res.setHeader('Content-Disposition', 'attachment');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+  },
+}));
 
 // ─── Parsers natifs BAC Cameroun ─────────────────────────────────────────────
 
@@ -1042,8 +1207,121 @@ function detectAndParseNative(text) {
   return null;
 }
 
+// ─── Utilitaires de récupération JSON pour les réponses IA (Gemini) ──────────
+function sanitizeJsonControlChars(text) {
+  let out = '';
+  let inString = false, escape = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const code = text.charCodeAt(i);
+    if (inString) {
+      if (escape) { out += ch; escape = false; continue; }
+      if (ch === '\\') { out += ch; escape = true; continue; }
+      if (ch === '"') { inString = false; out += ch; continue; }
+      if (code < 0x20) {
+        if (ch === '\n') out += '\\n';
+        else if (ch === '\t') out += '\\t';
+        else if (ch === '\r') { /* supprimé */ }
+        else out += '\\u' + code.toString(16).padStart(4, '0');
+        continue;
+      }
+      out += ch;
+      continue;
+    }
+    if (ch === '"') { inString = true; out += ch; continue; }
+    out += ch;
+  }
+  return out;
+}
+
+function extractCompleteJsonObjects(text) {
+  const rows = [];
+  let depth = 0, objStart = -1, inString = false, escape = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escape) { escape = false; }
+      else if (ch === '\\') { escape = true; }
+      else if (ch === '"') { inString = false; }
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '{') { if (depth === 0) objStart = i; depth++; }
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0 && objStart !== -1) {
+        const objStr = text.slice(objStart, i + 1);
+        try { rows.push(JSON.parse(objStr)); } catch {}
+        objStart = -1;
+      }
+    }
+  }
+  return rows;
+}
+
+function parseAiRowsResponse(raw) {
+  const original = raw || '';
+  const cleaned = sanitizeJsonControlChars(original.replace(/```json|```/g, '').trim());
+  try {
+    const parsed = JSON.parse(cleaned || '{}');
+    return { rows: Array.isArray(parsed.rows) ? parsed.rows : [], truncated: false };
+  } catch (e) {
+    const arrStart = cleaned.indexOf('[');
+    const rows = arrStart === -1 ? [] : extractCompleteJsonObjects(cleaned.slice(arrStart));
+    if (rows.length > 0) return { rows, truncated: true };
+    const snippet = original.slice(0, 300).replace(/\s+/g, ' ');
+    console.error('[parse-bac] Échec de parsing JSON. Extrait :', snippet || '(vide)');
+    throw new Error(
+      `La réponse de l'IA n'a pas pu être analysée (réponse vide, bloquée par un filtre de sécurité, ou format inattendu). ` +
+      `Extrait reçu : "${snippet || '(vide)'}"`
+    );
+  }
+}
+
+// ─── Découpage d'un PDF scanné en lots de pages ──────────────────────────────
+// Un bordereau MINESEC peut contenir 100+ candidats sur plusieurs pages
+// (généralement ~31 candidats/page). Envoyer le PDF entier en un seul appel
+// à Gemini dépassait le budget de tokens de sortie et tronquait la réponse
+// en plein milieu (JSON invalide). On découpe donc le PDF en sous-PDF de
+// quelques pages chacun, on interroge Gemini séparément sur chaque lot (en
+// parallèle, avec une limite de concurrence), puis on fusionne les résultats.
+const { PDFDocument } = require('pdf-lib');
+
+async function splitPdfIntoBatches(filePath, pagesPerBatch = 2) {
+  const bytes = fs.readFileSync(filePath);
+  const src = await PDFDocument.load(bytes);
+  const totalPages = src.getPageCount();
+  const batches = [];
+  for (let start = 0; start < totalPages; start += pagesPerBatch) {
+    const end = Math.min(start + pagesPerBatch, totalPages);
+    const sub = await PDFDocument.create();
+    const indices = Array.from({ length: end - start }, (_, i) => start + i);
+    const pages = await sub.copyPages(src, indices);
+    pages.forEach(p => sub.addPage(p));
+    const subBytes = await sub.save();
+    batches.push({ base64: Buffer.from(subBytes).toString('base64'), pageRange: `${start + 1}-${end}` });
+  }
+  return { batches, totalPages };
+}
+
+// Exécute une liste de tâches asynchrones avec un maximum de `limit` en
+// parallèle simultanément (évite de saturer le quota gratuit Gemini avec
+// trop de requêtes simultanées sur un gros bordereau).
+async function runWithConcurrencyLimit(tasks, limit) {
+  const results = new Array(tasks.length);
+  let next = 0;
+  async function worker() {
+    while (next < tasks.length) {
+      const i = next++;
+      results[i] = await tasks[i]();
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, worker));
+  return results;
+}
+
 // ─── Route POST /api/ai/parse-bac ────────────────────────────────────────────
-app.post('/api/ai/parse-bac', authMiddleware, upload.single('file'), async (req, res) => {
+app.post('/api/ai/parse-bac', authMiddleware, uploadImport.single('file'), handleUploadError, async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Aucun fichier recu' });
   const filePath = req.file.path;
   const ext = path.extname(req.file.originalname).toLowerCase();
@@ -1053,10 +1331,17 @@ app.post('/api/ai/parse-bac', authMiddleware, upload.single('file'), async (req,
 
     // ── Étape 1 : extraction du texte brut ──
     let text = '';
+    let isScannedPdf = false;
     if (ext === '.pdf') {
       const data = await require('pdf-parse')(fs.readFileSync(filePath));
-      if (!data.text?.trim()) throw new Error('PDF vide ou scanné (image). Convertissez-le en CSV/Excel d\'abord.');
-      text = data.text;
+      // Un PDF scanné (image sans couche texte) renvoie un texte vide ou
+      // quasi-vide (souvent quelques caractères parasites). Avant, ce cas
+      // provoquait un abandon immédiat avec un message invitant à convertir
+      // en CSV/Excel — alors que le bordereau MINESEC est très souvent un
+      // simple scan. On bascule maintenant sur l'extraction visuelle (Claude
+      // lit directement les pages du PDF comme des images, sans OCR local).
+      isScannedPdf = !data.text || data.text.trim().length < 20;
+      text = data.text || '';
     } else if (ext === '.docx' || ext === '.doc') {
       const r = await require('mammoth').extractRawText({ path: filePath });
       text = r.value;
@@ -1064,50 +1349,112 @@ app.post('/api/ai/parse-bac', authMiddleware, upload.single('file'), async (req,
       throw new Error(`Format ${ext} non supporté ici`);
     }
 
-    // ── Étape 2 : essai parsers natifs (GCE A-Level, ESG/IBTE) ──
-    const native = detectAndParseNative(text);
-    if (native && native.rows.length > 0) {
-      console.log(`[parse-bac] Format natif détecté : ${native.format_detected} — ${native.rows.length} lignes`);
-      return res.json({ rows: native.rows, count: native.rows.length, format_detected: native.format_detected });
+    // ── Étape 2 : essai parsers natifs (GCE A-Level, ESG/IBTE) — uniquement
+    // si une couche texte existe (un PDF scanné n'a pas de texte exploitable
+    // par ces regex, autant passer directement à l'IA visuelle).
+    if (!isScannedPdf) {
+      const native = detectAndParseNative(text);
+      if (native && native.rows.length > 0) {
+        console.log(`[parse-bac] Format natif détecté : ${native.format_detected} — ${native.rows.length} lignes`);
+        return res.json({ rows: native.rows, count: native.rows.length, format_detected: native.format_detected });
+      }
     }
 
-    // ── Étape 3 : fallback analyse IA (BAC francophone MINESEC ou autre) ──
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey || apiKey.startsWith('sk-ant-REMPLACEZ')) {
-      // Si pas de clé IA et pas de parser natif → erreur explicite
+    // ── Étape 3 : fallback analyse IA (BAC francophone MINESEC, ou PDF scanné) ──
+    // Migration Anthropic → Google Gemini (API gratuite, ~1500 req/jour).
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey || apiKey.startsWith('REMPLACEZ')) {
       throw new Error(
-        'Format non reconnu automatiquement et ANTHROPIC_API_KEY non configurée dans backend/.env. ' +
-        'Pour les PDF GCE A-Level et ESG/IBTE, le parsing natif est utilisé. Pour les autres formats, configurez la clé API Anthropic.'
+        isScannedPdf
+          ? 'Ce PDF semble scanné (image) : sa lecture nécessite GEMINI_API_KEY dans backend/.env (extraction visuelle par IA).'
+          : 'Format non reconnu automatiquement et GEMINI_API_KEY non configurée dans backend/.env. ' +
+            'Pour les PDF GCE A-Level et ESG/IBTE, le parsing natif est utilisé. Pour les autres formats, configurez la clé API Gemini (gratuite sur https://aistudio.google.com/apikey).'
       );
     }
 
-    const Anthropic = require('@anthropic-ai/sdk');
-    const client    = new Anthropic({ apiKey });
-    const truncated = text.length > 30000 ? text.slice(0, 30000) : text;
+    const { GoogleGenAI } = require('@google/genai');
+    const client = new GoogleGenAI({ apiKey });
 
-    const response = await client.messages.create({
-      model: 'claude-sonnet-4-6', max_tokens: 4096,
-      system: [
-        'Tu es un expert en résultats du Baccalauréat camerounais (MINESEC).',
-        'Extrais TOUS les candidats du bordereau fourni.',
-        'Réponds UNIQUEMENT en JSON valide, sans markdown, sans texte avant ou après.',
-        'Chaque candidat : { "numero_bac": "", "nom": "", "prenom": "", "full_name": "", "resultat": "pass|fail", "mention": "", "serie": "", "moyenne": null, "centre": "", "annee": "" }',
-        'Si un champ est absent, mets null ou chaîne vide.',
-        '"resultat" = "pass" si admis/reçu/réussi, "fail" si ajourné/échoué.',
-      ].join(' '),
-      messages: [{
-        role: 'user',
-        content: `Extrais tous les candidats. Réponds UNIQUEMENT avec {"rows":[...]}.\n\nTEXTE:\n${truncated}`,
-      }],
-    });
+    const SYSTEM_PROMPT = [
+      'Tu es un expert en résultats du Baccalauréat camerounais (MINESEC).',
+      'Extrais TOUS les candidats visibles sur le document/l\'extrait fourni (ne saute aucune ligne du tableau).',
+      'Réponds UNIQUEMENT en JSON valide, sans markdown, sans texte avant ou après.',
+      'Chaque candidat : { "numero_bac": "", "nom": "", "prenom": "", "full_name": "", "resultat": "pass|fail", "mention": "", "serie": "", "moyenne": null, "centre": "", "annee": "" }',
+      'Si un champ est absent, mets null ou chaîne vide.',
+      '"resultat" = "pass" si admis/reçu/réussi, "fail" si ajourné/échoué.',
+      'IMPORTANT : chaque valeur de chaîne doit tenir sur une seule ligne (pas de retour à la ligne brut dans une valeur JSON) — utilise \\n échappé si nécessaire.',
+    ].join(' ');
 
-    const raw    = response.content.find(b => b.type === 'text')?.text || '{}';
-    const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
-    rows = Array.isArray(parsed.rows) ? parsed.rows : [];
-    format_detected = 'BAC Francophone (IA)';
+    const GEMINI_MODEL = 'gemini-2.5-flash';
+    const GEMINI_CONFIG = {
+      systemInstruction: SYSTEM_PROMPT,
+      maxOutputTokens: 32768,
+      responseMimeType: 'application/json',
+    };
 
-    console.log(`[parse-bac] Extraction IA : ${rows.length} candidat(s)`);
-    res.json({ rows, count: rows.length, format_detected });
+    async function callGeminiWithContent(parts) {
+      const result = await client.models.generateContent({ model: GEMINI_MODEL, config: GEMINI_CONFIG, contents: [{ role: 'user', parts }] });
+      const finishReason = result.candidates?.[0]?.finishReason;
+      const rawText = result.text || '';
+      if (!rawText.trim() && finishReason && finishReason !== 'STOP') {
+        const reasons = {
+          SAFETY: "contenu bloqué par les filtres de sécurité de Gemini.",
+          RECITATION: "Gemini a détecté un possible contenu protégé et a refusé de le reproduire.",
+          MAX_TOKENS: "réponse coupée avant tout JSON exploitable.",
+          OTHER: "raison non précisée par l'API Gemini.",
+        };
+        throw new Error(`Extraction IA vide (${finishReason}) : ${reasons[finishReason] || reasons.OTHER}`);
+      }
+      const { rows: batchRows, truncated } = parseAiRowsResponse(rawText);
+      return { rows: batchRows, truncated: truncated || finishReason === 'MAX_TOKENS' };
+    }
+
+    let anyTruncated = false;
+
+    if (isScannedPdf) {
+      // ── PDF scanné : découpage en lots de 2 pages (≈ 60 candidats max par
+      // appel avec la mise en page MINESEC habituelle) pour rester largement
+      // sous la limite de tokens de sortie, quel que soit le nombre total de
+      // pages du bordereau. Les lots sont traités avec 3 appels simultanés
+      // maximum pour ne pas saturer le quota gratuit Gemini.
+      const { batches, totalPages } = await splitPdfIntoBatches(filePath, 2);
+      console.log(`[parse-bac] PDF scanné de ${totalPages} page(s) découpé en ${batches.length} lot(s)`);
+
+      const tasks = batches.map(b => async () => {
+        try {
+          const { rows: batchRows, truncated } = await callGeminiWithContent([
+            { inlineData: { mimeType: 'application/pdf', data: b.base64 } },
+            { text: `Extrais tous les candidats visibles sur ces pages (${b.pageRange}) du bordereau scanné. Réponds UNIQUEMENT avec {"rows":[...]}.` },
+          ]);
+          if (truncated) anyTruncated = true;
+          return batchRows;
+        } catch (err) {
+          console.error(`[parse-bac] Échec sur le lot pages ${b.pageRange} :`, err.message);
+          anyTruncated = true; // on ne bloque pas tout l'import pour un lot en échec
+          return [];
+        }
+      });
+
+      const batchResults = await runWithConcurrencyLimit(tasks, 3);
+      rows = batchResults.flat();
+      format_detected = 'BAC Francophone (IA — PDF scanné, ' + batches.length + ' lot(s))';
+    } else {
+      const truncatedText = text.length > 30000 ? text.slice(0, 30000) : text;
+      const { rows: textRows, truncated } = await callGeminiWithContent([
+        { text: `Extrais tous les candidats. Réponds UNIQUEMENT avec {"rows":[...]}.\n\nTEXTE:\n${truncatedText}` },
+      ]);
+      rows = textRows;
+      anyTruncated = truncated;
+      format_detected = 'BAC Francophone (IA)';
+    }
+
+    if (anyTruncated) {
+      console.warn(`[parse-bac] Extraction partielle — ${rows.length} candidat(s) récupéré(s).`);
+      format_detected += ' — extraction partielle, vérifiez le nombre de candidats';
+    }
+
+    console.log(`[parse-bac] Extraction IA${isScannedPdf ? ' visuelle (PDF scanné)' : ''} : ${rows.length} candidat(s)${anyTruncated ? ' (partiel)' : ''}`);
+    res.json({ rows, count: rows.length, format_detected, truncated: anyTruncated });
 
   } catch (err) {
     console.error('[parse-bac]', err.message);
@@ -1129,7 +1476,7 @@ app.get('/api/jury-config', authMiddleware, async (req, res) => {
 });
 
 // POST /api/jury-config/verify — vérifier le PIN entré (retourne true/false)
-app.post('/api/jury-config/verify', async (req, res) => {
+app.post('/api/jury-config/verify', pinRateLimit, async (req, res) => {
   const { pin } = req.body;
   if (!pin) return res.status(400).json({ valid: false });
   try {
@@ -1139,6 +1486,7 @@ app.post('/api/jury-config/verify', async (req, res) => {
       return res.json({ valid: false, error: 'Aucun PIN jury configure. Contactez le Super Admin.' });
     }
     const valid = await bcrypt.compare(pin, rows[0].pin_hash);
+    if (valid) pinAttempts.delete(req.ip || req.connection.remoteAddress || 'unknown');
     res.json({ valid });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1166,8 +1514,10 @@ app.put('/api/jury-config', authMiddleware, requireSuperAdmin, async (req, res) 
 });
 
 app.post('/api/email/send', authMiddleware, async (req, res) => {
-  console.info(`[email] → ${req.body.to} | ${req.body.subject}`);
-  res.json({ success: true, simulated: true });
+  const { to, subject, body } = req.body;
+  if (!to || !subject || !body) return res.status(400).json({ error: 'to, subject et body sont requis' });
+  const result = await sendMail(to, subject, body);
+  res.json(result);
 });
 
 app.get('/api/health', async (_req, res) => {
